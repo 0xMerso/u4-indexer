@@ -1,0 +1,136 @@
+// Uniswap v4 indexing engine schema
+// Event driven (no additional state reads)
+// Scoring by active liquidity, Merkle tree distribution
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+
+// One instance per V4 poo
+// It's created when PoolManager emits an Initialize event.
+model Pool {
+  id            Bytes     @id                   // poolId = keccak256(abi.encode(PoolKey))
+
+  chainId       Int
+  currency0     Bytes                            // address(0) means native ETH
+  currency1     Bytes
+  fee           Int                              // uint24, 0x800000 flag for dynamic fee
+  tickSpacing   Int                              // int24, derived from fee
+
+  hasHook       Boolean                          // quick filter
+  hook          Bytes?                           // null for pools without hooks
+  hookPerms     Int?                             // bit flags encoded in the low bits of the hook address
+
+  initBlock     BigInt
+  initialTick   Int                              // tick at Initialize, scorer fallback when epoch has no prior Swap
+
+  swaps         SwapEvent[]
+  modifies      ModifyLiquidityEvent[]
+  campaigns     Campaign[]
+
+  @@index([chainId])
+}
+
+
+// One instance per V4 Swap event
+model SwapEvent {
+  poolId        Bytes
+  block         BigInt
+  logIndex      Int
+
+  pool          Pool      @relation(fields: [poolId], references: [id], onDelete: Cascade)
+
+  tickBefore    Int                              // pool tick emitted by the Swap event (post-swap in V4)
+  feeAmount     Bytes                            // per swap fee, uint256, not used by the scorer but potentially used in a future fee weighted scoring approach
+
+  @@id([poolId, block, logIndex])
+  @@index([poolId, block])
+}
+
+
+// One row per V4 ModifyLiquidity emission
+// V4 merges mint and burn into a single event with a signed liquidity delta
+model ModifyLiquidityEvent {
+  poolId          Bytes
+  block           BigInt
+  logIndex        Int
+
+  pool            Pool    @relation(fields: [poolId], references: [id], onDelete: Cascade)
+
+  sender          Bytes                          // not the user/LP ! here it's usually the official PositionManager (via callback) or an ALM vault (Gamma or Arrakis for example) or other
+  tickLower       Int
+  tickUpper       Int
+  salt            Bytes                          // 32 bytes, for Uniswap PositionManager positions this encodes the tokenId
+  liquidityDelta  Bytes                          // signed int256, positive for mint, negative for burn
+
+  @@id([poolId, block, logIndex])
+  @@index([poolId, sender])
+}
+
+
+// Incentive program targeting one pool over a block range with a fixed budget
+model Campaign {
+  id            String    @id @default(cuid())
+
+  creator       Bytes
+  poolId        Bytes
+  pool          Pool      @relation(fields: [poolId], references: [id])
+
+  rewardToken   Bytes                            // assumed to live on the same chain as the pool
+  amount        Bytes                            // uint256, total reward budget in reward token base units
+
+  startBlock    BigInt
+  endBlock      BigInt
+
+  epochs        Epoch[]
+
+  @@index([poolId])
+  @@index([creator])
+}
+
+
+// One published Merkle root per Epoch
+model Epoch {
+  id                String    @id @default(cuid())
+
+  campaignId        String
+  campaign          Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  startBlock        BigInt
+  endBlock          BigInt
+
+  merkleRoot        Bytes?                       // null until the scorer sends the root onchain
+  publishedAt       DateTime?                    // when the root was submitted
+  publishedTxHash   Bytes?                       // tx that submitted updateRoot
+
+  leaves            Leaf[]
+
+  @@unique([campaignId, endBlock])
+  @@index([campaignId])
+}
+
+
+// One Merkle leaf per (epoch, positionManager, tokenId)
+// Leaf = keccak256(abi.encodePacked(positionManager, tokenId, rewardToken, cumulative))
+// rewardToken is added through the Epoch.campaign.rewardToken, not here
+// Claim is authorized via IERC721(positionManager).ownerOf(tokenId) == msg.sender
+model Leaf {
+  epochId        String
+  epoch          Epoch     @relation(fields: [epochId], references: [id], onDelete: Cascade)
+
+  positionManager    Bytes                       // PositionManager contract, e.g. Uniswap V4 PositionManager
+  tokenId        Bytes                           // the scorer skips events if tokenId is zero 
+
+  delta          Bytes                           // this epoch share, uint256
+  cumulative     Bytes                           // running total since campaign start, hashed into the leaf
+  proof          Bytes?                          
+
+  @@id([epochId, positionManager, tokenId])
+  @@index([positionManager, tokenId])
+}
